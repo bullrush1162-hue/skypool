@@ -2,15 +2,18 @@
   "name": "skypool",
   "version": "1.0.0",
   "type": "module",
+  "description": "Pool multiple Google Drives into one read-only WebDAV drive + upload inbox",
   "main": "server.js",
-  "license": "MIT",
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
-    "basic-auth": "2.0.1",
-    "better-sqlite3": "9.6.0",
-    "dotenv": "16.4.5",
-    "express": "4.19.2",
-    "googleapis": "144.0.0",
-    "multer": "1.4.5-lts.1",
-    "uuid": "9.0.1"
+    "basic-auth": "^2.0.1",
+    "better-sqlite3": "^9.4.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "googleapis": "^133.0.0",
+    "multer": "^1.4.5-lts.1",
+    "uuid": "^9.0.1"
   }
 }
