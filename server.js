@@ -1,21 +1,10 @@
-// server-webdav.js
-// DistFS Web Backend (free-tier friendly) + Read-only WebDAV for Windows mapping
-// - Pooled storage across multiple Google Drives using chunking + manifest
-// - OAuth login per Google account (no passwords)
-// - Simple web UI for upload and listing
-// - Read-only WebDAV at /dav to map a network drive in Windows (browse + download)
+// server.js (SkyPool — refined)
+// - Keeps original filename & MIME type on download
+// - Shows the same filename in Web UI, /download and WebDAV
+// - Minor hardening for headers and encoding
 //
-// Deps: npm i express multer better-sqlite3 googleapis uuid dotenv basic-auth
-// Start: node server-webdav.js
-//
-// ENV (.env):
-// PORT=8080
-// BASE_URL=http://localhost:8080
-// GOOGLE_CLIENT_ID=...
-// GOOGLE_CLIENT_SECRET=...
-// GOOGLE_REDIRECT_URI=http://localhost:8080/oauth2/callback
-// WEBDAV_USER=demo
-// WEBDAV_PASS=demo
+// Deps:
+//   npm i express multer better-sqlite3 googleapis uuid dotenv basic-auth mime-types
 
 import express from 'express';
 import multer from 'multer';
@@ -28,22 +17,33 @@ import path from 'path';
 import crypto from 'crypto';
 import dotenv from 'dotenv';
 import basicAuth from 'basic-auth';
+import mime from 'mime-types';
 
 dotenv.config();
 
 const PORT = process.env.PORT || 8080;
-const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
-const DAV_USER = process.env.WEBDAV_USER || 'demo';
-const DAV_PASS = process.env.WEBDAV_PASS || 'demo';
+const BASE_URL = (process.env.BASE_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
+const DAV_USER = process.env.WEBDAV_USER || 'skypool';
+const DAV_PASS = process.env.WEBDAV_PASS || 'skypool';
 
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const upload = multer({ dest: path.join(process.cwd(), 'tmp_uploads') });
+// temp dirs
+const TMP_UPLOAD_DIR = path.join(process.cwd(), 'tmp_uploads');
+const TMP_CHUNK_DIR = path.join(process.cwd(), 'tmp_chunks');
+const TMP_RESTORE_DIR = path.join(process.cwd(), 'tmp_restore');
+await fs.mkdir(TMP_UPLOAD_DIR, { recursive: true });
+await fs.mkdir(TMP_CHUNK_DIR, { recursive: true });
+await fs.mkdir(TMP_RESTORE_DIR, { recursive: true });
 
-// DB
+// Multer to accept one file
+const upload = multer({ dest: TMP_UPLOAD_DIR });
+
+// DB setup
 const db = new Database('distfs.db');
+db.pragma('journal_mode = WAL');
 db.exec(`
 CREATE TABLE IF NOT EXISTS accounts (
   id TEXT PRIMARY KEY,
@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS accounts (
 CREATE TABLE IF NOT EXISTS manifests (
   id TEXT PRIMARY KEY,
   original_name TEXT,
+  original_mime TEXT,
   size INTEGER,
   sha256 TEXT,
   chunk_size_mb INTEGER,
@@ -72,7 +73,7 @@ CREATE TABLE IF NOT EXISTS parts (
 );
 `);
 
-// OAuth
+// Google OAuth client
 function oauth2Client() {
   return new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
@@ -80,7 +81,6 @@ function oauth2Client() {
     process.env.GOOGLE_REDIRECT_URI
   );
 }
-
 const SCOPES = [
   'https://www.googleapis.com/auth/drive.file',
   'https://www.googleapis.com/auth/drive.metadata.readonly',
@@ -106,7 +106,17 @@ async function driveUpload({ client, name, mimeType, data }) {
     requestBody: { name },
     media: { mimeType, body: data }
   }, { headers: { 'X-Upload-Content-Type': mimeType } });
-  return res.data;
+  return res.data; // { id, name }
+}
+
+function safeFileName(name) {
+  // Avoid header injection & odd characters; keep extension
+  const base = path.basename(name).replace(/["\\\r\n]/g, '_');
+  return base || 'file';
+}
+
+function contentTypeFor(name, fallback = 'application/octet-stream') {
+  return mime.lookup(name) || fallback;
 }
 
 async function sha256File(filePath) {
@@ -122,7 +132,7 @@ async function sha256File(filePath) {
 async function splitFileToDir(filePath, chunkSizeMB, outDir) {
   await fs.mkdir(outDir, { recursive: true });
   const stat = await fs.stat(filePath);
-  const chunkSize = chunkSizeMB * 1024 * 1024;
+  const chunkSize = Math.max(1, chunkSizeMB) * 1024 * 1024;
   const base = path.basename(filePath);
   const parts = [];
   await new Promise((resolve, reject) => {
@@ -144,10 +154,9 @@ async function splitFileToDir(filePath, chunkSizeMB, outDir) {
   return { parts, baseName: base, size: stat.size };
 }
 
-// UI
+// ---------------- UI ----------------
 app.get('/', async (req, res) => {
   const accounts = getAccounts();
-  // get per-account storage usage via Drive about.get
   const usages = [];
   for (const a of accounts) {
     try {
@@ -167,10 +176,15 @@ app.get('/', async (req, res) => {
   }
   const totalLimit = usages.reduce((s, u) => s + (u.limit || 0), 0);
   const totalUsage = usages.reduce((s, u) => s + (u.usage || 0), 0);
+  const m = db.prepare('SELECT * FROM manifests ORDER BY created_at DESC LIMIT 200').all();
 
-  const m = db.prepare('SELECT * FROM manifests ORDER BY created_at DESC LIMIT 100').all();
+  const listItems = m.map(x => {
+    const href = `${BASE_URL}/download?manifestId=${encodeURIComponent(x.id)}`;
+    return `<li>${safeFileName(x.original_name)} — ${(x.size/1e9).toFixed(3)} GB — <a href="${href}">download</a></li>`;
+  }).join('') || '<i>none yet</i>';
+
   res.type('html').send(`
-  <html><head><title>DistFS</title><meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <html><head><title>DistFS (SkyPool)</title><meta name="viewport" content="width=device-width,initial-scale=1"/>
   <style>body{font-family:system-ui,Arial;margin:20px;max-width:900px} .card{padding:14px;border:1px solid #eee;border-radius:12px;margin:10px 0}</style></head>
   <body>
     <h1>DistFS (pooled Google Drives)</h1>
@@ -192,15 +206,13 @@ app.get('/', async (req, res) => {
 
     <div class="card">
       <h3>Files</h3>
-      <ul>
-        ${m.map(x => `<li>${x.original_name} — ${(x.size/1e9).toFixed(3)} GB — <a href="/download?manifestId=${x.id}">download</a></li>`).join('') || '<i>none yet</i>'}
-      </ul>
-      <p>WebDAV (read-only): <code>${BASE_URL.replace(/\/$/, '')}/dav</code> — user: <b>${DAV_USER}</b>, pass: <b>${DAV_PASS}</b></p>
+      <ul>${listItems}</ul>
+      <p>WebDAV (read-only): <code>${BASE_URL}/dav</code> — user: <b>${DAV_USER}</b>, pass: <b>${DAV_PASS}</b></p>
     </div>
   </body></html>`);
 });
 
-// OAuth
+// ---------------- OAuth ----------------
 app.get('/oauth2/start', (req, res) => {
   const client = oauth2Client();
   const url = client.generateAuthUrl({ access_type: 'offline', prompt: 'consent', scope: SCOPES });
@@ -212,7 +224,7 @@ app.get('/oauth2/callback', async (req, res) => {
     const client = oauth2Client();
     const { code } = req.query;
     const { tokens } = await client.getToken(String(code));
-    if (!tokens.refresh_token) throw new Error('No refresh_token (try with prompt=consent)');
+    if (!tokens.refresh_token) throw new Error('No refresh_token (ensure prompt=consent)');
     client.setCredentials(tokens);
 
     const oauth2 = google.oauth2({ version: 'v2', auth: client });
@@ -228,21 +240,26 @@ app.get('/oauth2/callback', async (req, res) => {
   } catch (e) { res.status(500).send(String(e)); }
 });
 
-// Upload
+// ---------------- Upload ----------------
 app.post('/upload', upload.single('file'), async (req, res) => {
   try {
     const accounts = getAccounts();
     if (!accounts.length) return res.status(400).send('Add an account first');
 
     const tmpPath = req.file.path;
+    const suppliedMime = req.file.mimetype || 'application/octet-stream';
+    const originalName = safeFileName(req.file.originalname || 'file');
     const chunkMB = Math.max(64, Math.min(2048, Number(req.body.chunk || 512)));
+
     const fileSha = await sha256File(tmpPath);
     const manifestId = uuidv4();
-    const tmpDir = path.join(process.cwd(), 'tmp_chunks', manifestId);
+    const tmpDir = path.join(TMP_CHUNK_DIR, manifestId);
     const { parts, baseName, size } = await splitFileToDir(tmpPath, chunkMB, tmpDir);
 
-    db.prepare('INSERT INTO manifests (id, original_name, size, sha256, chunk_size_mb, created_at) VALUES (?,?,?,?,?,?)')
-      .run(manifestId, baseName, size, fileSha, chunkMB, Date.now());
+    const originalMime = suppliedMime || contentTypeFor(originalName);
+
+    db.prepare('INSERT INTO manifests (id, original_name, original_mime, size, sha256, chunk_size_mb, created_at) VALUES (?,?,?,?,?,?,?)')
+      .run(manifestId, originalName, originalMime, size, fileSha, chunkMB, Date.now());
 
     let aIdx = 0;
     for (let i = 0; i < parts.length; i++) {
@@ -262,20 +279,34 @@ app.post('/upload', upload.single('file'), async (req, res) => {
   } catch (e) { console.error(e); res.status(500).send(String(e)); }
 });
 
-// Download assembled
+// ---------------- Manifests API ----------------
+app.get('/manifests/:id', (req, res) => {
+  const id = req.params.id;
+  const m = db.prepare('SELECT * FROM manifests WHERE id=?').get(id);
+  if (!m) return res.status(404).send('Not found');
+  const parts = db.prepare('SELECT * FROM parts WHERE manifest_id=? ORDER BY idx ASC').all(id);
+  res.json({ ...m, parts });
+});
+
+// ---------------- Download (assembled) ----------------
 app.get('/download', async (req, res) => {
   try {
     const manifestId = String(req.query.manifestId);
     const m = db.prepare('SELECT * FROM manifests WHERE id=?').get(manifestId);
     if (!m) return res.status(404).send('Manifest not found');
+
+    const originalName = safeFileName(m.original_name || 'file');
+    const ctype = m.original_mime || contentTypeFor(originalName);
+
+    // RFC 5987 filename* for UTF‑8 names
+    const dispo = `attachment; filename="${originalName}"; filename*=UTF-8''${encodeURIComponent(originalName)}`;
+    res.setHeader('Content-Type', ctype);
+    res.setHeader('Content-Disposition', dispo);
+
+    // We don't set Content-Length (streaming from multiple sources)
     const parts = db.prepare('SELECT * FROM parts WHERE manifest_id=? ORDER BY idx ASC').all(manifestId);
 
-    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(m.original_name)}"`);
-    res.setHeader('Content-Type', 'application/octet-stream');
-
-    // Stream assembled file
-    for (let i = 0; i < parts.length; i++) {
-      const p = parts[i];
+    for (const p of parts) {
       const { client } = await clientForAccount(p.account_id);
       const drive = google.drive({ version: 'v3', auth: client });
       const dl = await drive.files.get({ fileId: p.drive_file_id, alt: 'media' }, { responseType: 'stream' });
@@ -289,21 +320,18 @@ app.get('/download', async (req, res) => {
   } catch (e) { console.error(e); res.status(500).send(String(e)); }
 });
 
-// ----------------- Minimal Read-only WebDAV -----------------
+// ---------------- WebDAV (read‑only) ----------------
 function davAuth(req, res, next) {
   const creds = basicAuth(req);
   if (!creds || creds.name !== DAV_USER || creds.pass !== DAV_PASS) {
-    res.set('WWW-Authenticate', 'Basic realm="DistFS"');
+    res.set('WWW-Authenticate', 'Basic realm="SkyPool"');
     return res.status(401).send('Auth required');
   }
   next();
 }
 
 function xmlMultiStatus(items) {
-  return `<?xml version="1.0" encoding="utf-8"?>\n` +
-`<d:multistatus xmlns:d="DAV:">` +
-items.join('') +
-`</d:multistatus>`;
+  return `<?xml version="1.0" encoding="utf-8"?>\n<d:multistatus xmlns:d="DAV:">${items.join('')}</d:multistatus>`;
 }
 
 function xmlResponse(href, isCollection, size) {
@@ -314,15 +342,18 @@ app.options('/dav*', davAuth, (req, res) => {
   res.set({ 'DAV': '1,2', 'Allow': 'OPTIONS, PROPFIND, GET', 'MS-Author-Via': 'DAV' });
   res.status(200).end();
 });
+app.all('/dav*', davAuth);
 
-app.all('/dav*', davAuth); // protect all DAV routes
-
-// PROPFIND root or a manifest folder
-app.propfind = app.propfind || function (path, handler) { return app.all(path, (req, res) => { if ((req.method || '').toUpperCase() === 'PROPFIND') handler(req, res); else res.status(405).end(); }); };
+app.propfind = app.propfind || function (pathSpec, handler) {
+  return app.all(pathSpec, (req, res) => {
+    if ((req.method || '').toUpperCase() === 'PROPFIND') handler(req, res);
+    else res.status(405).end();
+  });
+};
 
 app.propfind('/dav', async (req, res) => {
   const depth = req.headers.depth || '1';
-  const base = BASE_URL.replace(/\/$/, '') + '/dav';
+  const base = `${BASE_URL}/dav`;
   const manifests = db.prepare('SELECT id, original_name, size FROM manifests ORDER BY created_at DESC').all();
   const items = [ xmlResponse(base + '/', true) ];
   if (depth !== '0') {
@@ -335,24 +366,27 @@ app.propfind('/dav', async (req, res) => {
 
 app.propfind('/dav/:manifestId', async (req, res) => {
   const id = req.params.manifestId;
-  const base = BASE_URL.replace(/\/$/, '') + `/dav/${encodeURIComponent(id)}`;
+  const base = `${BASE_URL}/dav/${encodeURIComponent(id)}`;
   const m = db.prepare('SELECT id, original_name, size FROM manifests WHERE id=?').get(id);
   if (!m) return res.status(404).end();
   const items = [ xmlResponse(base + '/', true) ];
-  items.push(xmlResponse(`${base}/${encodeURIComponent(m.original_name)}`, false, m.size));
+  const fname = safeFileName(m.original_name);
+  items.push(xmlResponse(`${base}/${encodeURIComponent(fname)}`, false, m.size));
   res.type('application/xml').status(207).send(xmlMultiStatus(items));
 });
 
-// GET file stream from WebDAV path /dav/:manifestId/:filename
 app.get('/dav/:manifestId/:filename', async (req, res) => {
   try {
     const { manifestId } = req.params;
     const m = db.prepare('SELECT * FROM manifests WHERE id=?').get(manifestId);
     if (!m) return res.status(404).send('Not found');
-    const parts = db.prepare('SELECT * FROM parts WHERE manifest_id=? ORDER BY idx ASC').all(manifestId);
-    res.setHeader('Content-Type', 'application/octet-stream');
-    res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(m.original_name)}"`);
 
+    const originalName = safeFileName(m.original_name || req.params.filename);
+    const ctype = m.original_mime || contentTypeFor(originalName);
+    res.setHeader('Content-Type', ctype);
+    res.setHeader('Content-Disposition', `inline; filename="${originalName}"; filename*=UTF-8''${encodeURIComponent(originalName)}`);
+
+    const parts = db.prepare('SELECT * FROM parts WHERE manifest_id=? ORDER BY idx ASC').all(manifestId);
     for (const p of parts) {
       const { client } = await clientForAccount(p.account_id);
       const drive = google.drive({ version: 'v3', auth: client });
@@ -363,4 +397,5 @@ app.get('/dav/:manifestId/:filename', async (req, res) => {
   } catch (e) { console.error(e); res.status(500).send(String(e)); }
 });
 
-app.listen(PORT, () => console.log(`DistFS (free-tier) running on ${BASE_URL} — WebDAV at /dav`));
+app.listen(PORT, () => console.log(`SkyPool running on ${BASE_URL} — WebDAV at /dav`));
+    
