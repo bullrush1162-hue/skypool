@@ -1,10 +1,11 @@
-// SkyPool — Postgres-backed (persists across restarts) + Admin auth for dashboard
-// Fixes:
-// 1) Accounts/files disappearing after sleep → store in Postgres (DATABASE_URL)
-// 2) "Logged out" after cold start → refresh tokens are in DB; no per-process session used
-// 3) Protect the dashboard so others can't see your pooled drives → ADMIN_USER/ADMIN_PASS
+// SkyPool — Postgres‑backed pooled Google Drives
+// Persists accounts & file manifests across restarts (DATABASE_URL)
+// Admin‑only dashboard (basic auth) + read‑only WebDAV
+// Correct filename & Content‑Type on download
 //
-// Deps: npm i express multer pg googleapis uuid dotenv basic-auth mime-types
+// Deps (package.json):
+//   "express", "multer", "pg", "googleapis", "uuid", "dotenv", "basic-auth", "mime-types"
+// Node >= 18
 
 import express from 'express';
 import multer from 'multer';
@@ -23,17 +24,25 @@ dotenv.config();
 
 const PORT = process.env.PORT || 8080;
 const BASE_URL = (process.env.BASE_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
+
+// Admin creds to see dashboard and upload
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
 const ADMIN_PASS = process.env.ADMIN_PASS || 'change-me';
+// WebDAV read-only creds
 const DAV_USER = process.env.WEBDAV_USER || 'skypool';
 const DAV_PASS = process.env.WEBDAV_PASS || 'skypool';
-const DATABASE_URL = process.env.DATABASE_URL;
-if (!DATABASE_URL) throw new Error('Missing DATABASE_URL env var (use Render/Railway Postgres).');
 
-const pool = new Pool({ connectionString: DATABASE_URL, ssl: process.env.PGSSLMODE === 'disable' ? false : { rejectUnauthorized: false } });
+// Postgres for persistence (Render/Railway etc)
+const DATABASE_URL = process.env.DATABASE_URL;
+if (!DATABASE_URL) throw new Error('Missing DATABASE_URL env var');
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: process.env.PGSSLMODE === 'disable' ? false : { rejectUnauthorized: false },
+});
 
 async function query(q, params) { const { rows } = await pool.query(q, params); return rows; }
 
+// One-time migrations
 async function migrate() {
   await query(`CREATE TABLE IF NOT EXISTS accounts(
     id TEXT PRIMARY KEY,
@@ -63,7 +72,7 @@ async function migrate() {
   )`);
 }
 
-// OAuth helpers
+// ----- Google OAuth helpers -----
 function oauth2Client() {
   return new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
@@ -74,13 +83,11 @@ function oauth2Client() {
 const SCOPES = [
   'https://www.googleapis.com/auth/drive.file',
   'https://www.googleapis.com/auth/drive.metadata.readonly',
-  'email',
-  'profile'
+  'email', 'profile'
 ];
 
 async function getAccounts() { return await query('SELECT * FROM accounts ORDER BY created_at ASC'); }
 async function getAccount(id) { const r = await query('SELECT * FROM accounts WHERE id=$1', [id]); return r[0]; }
-
 async function clientForAccount(accountId) {
   const acc = await getAccount(accountId);
   if (!acc) throw new Error('Account not found');
@@ -92,12 +99,12 @@ async function clientForAccount(accountId) {
 async function driveUpload({ client, name, mimeType, data }) {
   const drive = google.drive({ version: 'v3', auth: client });
   const res = await drive.files.create({ requestBody: { name }, media: { mimeType, body: data } }, { headers: { 'X-Upload-Content-Type': mimeType } });
-  return res.data;
+  return res.data; // { id, name }
 }
 
+// ----- utils -----
 function safeFileName(name) { return (path.basename(name || 'file')).replace(/["\\\r\n]/g, '_') || 'file'; }
-function contentTypeFor(name, fallback = 'application/octet-stream') { return mime.lookup(name) || fallback; }
-
+function contentTypeFor(name, fallback='application/octet-stream') { return mime.lookup(name) || fallback; }
 async function sha256File(filePath) { return await new Promise((resolve, reject) => {
   const hash = crypto.createHash('sha256');
   const s = fssync.createReadStream(filePath);
@@ -112,22 +119,34 @@ async function splitFileToDir(filePath, chunkSizeMB, outDir) {
   const parts = [];
   await new Promise((resolve, reject) => {
     const rs = fssync.createReadStream(filePath, { highWaterMark: chunkSize });
-    let idx = 0; rs.on('data', (buf) => { const name = `${base}.part.${String(idx).padStart(5,'0')}`; const p = path.join(outDir, name); rs.pause(); fssync.writeFileSync(p, buf); const h = crypto.createHash('sha256').update(buf).digest('hex'); parts.push({ idx, path: p, size: buf.length, sha256: h, name }); idx++; rs.resume(); });
+    let idx = 0;
+    rs.on('data', (buf) => {
+      const name = `${base}.part.${String(idx).padStart(5,'0')}`;
+      const p = path.join(outDir, name);
+      rs.pause();
+      fssync.writeFileSync(p, buf);
+      const h = crypto.createHash('sha256').update(buf).digest('hex');
+      parts.push({ idx, path: p, size: buf.length, sha256: h, name });
+      idx++; rs.resume();
+    });
     rs.on('end', resolve); rs.on('error', reject);
   });
-  return { parts, baseName: base, size: stat.size };
+  return { parts, size: stat.size };
 }
 
+// ----- app -----
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 const TMP_UPLOAD_DIR = path.join(process.cwd(), 'tmp_uploads');
-const TMP_CHUNK_DIR = path.join(process.cwd(), 'tmp_chunks');
+const TMP_CHUNK_DIR  = path.join(process.cwd(), 'tmp_chunks');
 await fs.mkdir(TMP_UPLOAD_DIR, { recursive: true });
-await fs.mkdir(TMP_CHUNK_DIR, { recursive: true });
+await fs.mkdir(TMP_CHUNK_DIR,  { recursive: true });
+
 const upload = multer({ dest: TMP_UPLOAD_DIR });
 
+// Admin basic auth for dashboard & /upload
 function adminAuth(req, res, next) {
   const creds = basicAuth(req);
   if (!creds || creds.name !== ADMIN_USER || creds.pass !== ADMIN_PASS) {
@@ -137,7 +156,7 @@ function adminAuth(req, res, next) {
   next();
 }
 
-// Dashboard (protected)
+// Dashboard
 app.get('/', adminAuth, async (req, res) => {
   const accounts = await getAccounts();
   const usages = [];
@@ -186,13 +205,12 @@ app.get('/oauth2/start', (req, res) => {
   const url = client.generateAuthUrl({ access_type: 'offline', prompt: 'consent', scope: SCOPES });
   res.redirect(url);
 });
-
 app.get('/oauth2/callback', async (req, res) => {
   try {
     const client = oauth2Client();
     const { code } = req.query;
     const { tokens } = await client.getToken(String(code));
-    if (!tokens.refresh_token) throw new Error('No refresh_token (make sure consent screen shows and prompt=consent).');
+    if (!tokens.refresh_token) throw new Error('No refresh_token (ensure consent screen and prompt=consent)');
     client.setCredentials(tokens);
     const oauth2 = google.oauth2({ version: 'v2', auth: client });
     const me = await oauth2.userinfo.get();
@@ -204,9 +222,8 @@ app.get('/oauth2/callback', async (req, res) => {
   } catch (e) { res.status(500).send(String(e)); }
 });
 
-// Upload (public form, but storage placement is backend-controlled)
-const uploadMw = multer({ dest: TMP_UPLOAD_DIR });
-app.post('/upload', adminAuth, uploadMw.single('file'), async (req, res) => {
+// Upload (admin only)
+app.post('/upload', adminAuth, upload.single('file'), async (req, res) => {
   try {
     const accounts = await getAccounts();
     if (!accounts.length) return res.status(400).send('Add an account first');
@@ -253,28 +270,27 @@ app.get('/download', async (req, res) => {
   } catch (e) { console.error(e); res.status(500).send(String(e)); }
 });
 
-// WebDAV (read-only)
-function davAuth(req, res, next) { const creds = basicAuth(req); if (!creds || creds.name !== DAV_USER || creds.pass !== DAV_PASS) { res.set('WWW-Authenticate', 'Basic realm="SkyPool DAV"'); return res.status(401).send('Auth required'); } next(); }
-function xmlMultiStatus(items) { return `<?xml version="1.0" encoding="utf-8"?>\n<d:multistatus xmlns:d="DAV:">${items.join('')}</d:multistatus>`; }
-function xmlResponse(href, isCollection, size) { return `\n<d:response>\n  <d:href>${href}</d:href>\n  <d:propstat>\n    <d:prop>\n      <d:resourcetype>${isCollection ? '<d:collection/>' : ''}</d:resourcetype>\n      ${!isCollection ? `<d:getcontentlength>${size}</d:getcontentlength>` : ''}\n    </d:prop>\n    <d:status>HTTP/1.1 200 OK</d:status>\n  </d:propstat>\n</d:response>`; }
+// ------------- WebDAV (read‑only) -------------
+function davAuth(req, res, next) { const c = basicAuth(req); if (!c || c.name !== DAV_USER || c.pass !== DAV_PASS) { res.set('WWW-Authenticate', 'Basic realm="SkyPool DAV"'); return res.status(401).send('Auth required'); } next(); }
+function xmlMultiStatus(items){ return `<?xml version="1.0" encoding="utf-8"?>\n<d:multistatus xmlns:d="DAV:">${items.join('')}</d:multistatus>`; }
+function xmlResponse(href,isCollection,size){ return `\n<d:response>\n  <d:href>${href}</d:href>\n  <d:propstat>\n    <d:prop>\n      <d:resourcetype>${isCollection?'<d:collection/>':''}</d:resourcetype>\n      ${!isCollection?`<d:getcontentlength>${size}</d:getcontentlength>`:''}\n    </d:prop>\n    <d:status>HTTP/1.1 200 OK</d:status>\n  </d:propstat>\n</d:response>`; }
 
-app.options('/dav*', davAuth, (req, res) => { res.set({ 'DAV': '1,2', 'Allow': 'OPTIONS, PROPFIND, GET', 'MS-Author-Via': 'DAV' }); res.status(200).end(); });
+app.options('/dav*', davAuth, (req,res)=>{ res.set({ 'DAV':'1,2', 'Allow':'OPTIONS, PROPFIND, GET', 'MS-Author-Via':'DAV' }); res.status(200).end(); });
 app.all('/dav*', davAuth);
-app.all('/dav', davAuth, async (req, res, next) => { if ((req.method||'').toUpperCase() === 'PROPFIND') return next(); res.status(405).end(); });
-app.all('/dav/:manifestId', davAuth, async (req, res, next) => { if ((req.method||'').toUpperCase() === 'PROPFIND') return next(); res.status(405).end(); });
+app.all('/dav', davAuth, async (req,res,next)=>{ if ((req.method||'').toUpperCase()==='PROPFIND') return next(); res.status(405).end(); });
+app.all('/dav/:manifestId', davAuth, async (req,res,next)=>{ if ((req.method||'').toUpperCase()==='PROPFIND') return next(); res.status(405).end(); });
 
-app.all('/dav', davAuth, async (req, res) => {
+app.all('/dav', davAuth, async (req,res)=>{
   const depth = req.headers.depth || '1';
   const base = `${BASE_URL}/dav`;
   const manifests = await query('SELECT id, original_name, size FROM manifests ORDER BY created_at DESC');
   const items = [ xmlResponse(base + '/', true) ];
-  if (depth !== '0') { for (const m of manifests) items.push(xmlResponse(`${base}/${encodeURIComponent(m.id)}/`, true)); }
+  if (depth !== '0') for (const m of manifests) items.push(xmlResponse(`${base}/${encodeURIComponent(m.id)}/`, true));
   res.type('application/xml').status(207).send(xmlMultiStatus(items));
 });
 
-app.all('/dav/:manifestId', davAuth, async (req, res) => {
-  const id = req.params.manifestId;
-  const base = `${BASE_URL}/dav/${encodeURIComponent(id)}`;
+app.all('/dav/:manifestId', davAuth, async (req,res)=>{
+  const id = req.params.manifestId; const base = `${BASE_URL}/dav/${encodeURIComponent(id)}`;
   const m = (await query('SELECT id, original_name, size FROM manifests WHERE id=$1', [id]))[0];
   if (!m) return res.status(404).end();
   const items = [ xmlResponse(base + '/', true) ];
@@ -283,16 +299,16 @@ app.all('/dav/:manifestId', davAuth, async (req, res) => {
   res.type('application/xml').status(207).send(xmlMultiStatus(items));
 });
 
-app.get('/dav/:manifestId/:filename', davAuth, async (req, res) => {
+app.get('/dav/:manifestId/:filename', davAuth, async (req,res)=>{
   try {
-    const { manifestId } = req.params;
-    const m = (await query('SELECT * FROM manifests WHERE id=$1', [manifestId]))[0];
+    const id = req.params.manifestId;
+    const m = (await query('SELECT * FROM manifests WHERE id=$1', [id]))[0];
     if (!m) return res.status(404).send('Not found');
     const originalName = safeFileName(m.original_name || req.params.filename);
     const ctype = m.original_mime || contentTypeFor(originalName);
     res.setHeader('Content-Type', ctype);
     res.setHeader('Content-Disposition', `inline; filename="${originalName}"; filename*=UTF-8''${encodeURIComponent(originalName)}`);
-    const parts = await query('SELECT * FROM parts WHERE manifest_id=$1 ORDER BY idx ASC', [manifestId]);
+    const parts = await query('SELECT * FROM parts WHERE manifest_id=$1 ORDER BY idx ASC', [id]);
     for (const p of parts) {
       const { client } = await clientForAccount(p.account_id);
       const drive = google.drive({ version: 'v3', auth: client });
@@ -304,4 +320,4 @@ app.get('/dav/:manifestId/:filename', davAuth, async (req, res) => {
 });
 
 await migrate();
-app.listen(PORT, () => console.log(`SkyPool (PG) running on ${BASE_URL} — WebDAV at /dav`));
+app.listen(PORT, () => console.log(`SkyPool running on ${BASE_URL} — WebDAV at /dav`));
